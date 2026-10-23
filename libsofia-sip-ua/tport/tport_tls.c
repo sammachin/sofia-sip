@@ -292,7 +292,11 @@ void tls_set_default(tls_issues_t *i)
   i->cert = i->cert ? i->cert : "agent.pem";
   i->key = i->key ? i->key : i->cert;
   i->randFile = i->randFile ? i->randFile : "tls_seed.dat";
-  i->CAfile = i->CAfile ? i->CAfile : "cafile.pem";
+  /* Leave CAfile NULL when not configured.  A NULL CAfile means "no explicit
+     trust anchors supplied"; the outbound/client context then relies on the
+     system trust store (see use_system_ca in tls_init_context).  Historically
+     this defaulted to "cafile.pem", which failed to load on most systems and
+     aborted context initialisation. */
   i->ciphers = i->ciphers ? i->ciphers : "!eNULL:!aNULL:!EXP:!LOW:!MD5:ALL:@STRENGTH";
   /* Default SIP cipher */
   /* "RSA-WITH-AES-128-CBC-SHA"; */
@@ -530,15 +534,33 @@ int tls_init_context(tls_t *tls, tls_issues_t const *ti)
 #endif
   }
 
-  if (!SSL_CTX_load_verify_locations(tls->ctx,
-                                     ti->CAfile,
-                                     ti->CApath)) {
-    SU_DEBUG_1(("%s: error loading CA list: %s\n",
-		 "tls_init_context", ti->CAfile));
-    if (ti->configured > 0)
-      tls_log_errors(3, "tls_init_context(CA)", 0);
-    errno = EIO;
-    return -1;
+  /* Consult the OpenSSL default (system) trust store so that peers presenting a
+     certificate chained to a public CA verify without extra configuration.
+     Scoped to the outbound/client context (use_system_ca) so the listener's
+     inbound client-cert trust stays restricted to its configured CAfile. */
+  if (ti->use_system_ca) {
+    if (!SSL_CTX_set_default_verify_paths(tls->ctx)) {
+      SU_DEBUG_3(("%s: could not load system default CA paths\n",
+		   "tls_init_context"));
+      tls_log_errors(3, "tls_init_context(default_verify_paths)", 0);
+      /* non-fatal: an explicit CAfile/CApath below may still provide trust */
+    }
+  }
+
+  /* Additionally trust an explicitly-configured CA file / directory (e.g. a
+     private or self-signed CA).  Layered on top of the system store, not a
+     replacement.  Only attempted when actually configured. */
+  if (ti->CAfile || ti->CApath) {
+    if (!SSL_CTX_load_verify_locations(tls->ctx,
+                                       ti->CAfile,
+                                       ti->CApath)) {
+      SU_DEBUG_1(("%s: error loading CA list: %s\n",
+		   "tls_init_context", ti->CAfile ? ti->CAfile : "(CApath)"));
+      if (ti->configured > 0)
+        tls_log_errors(3, "tls_init_context(CA)", 0);
+      errno = EIO;
+      return -1;
+    }
   }
 
   /* corresponds to (enum tport_tls_verify_policy) */
