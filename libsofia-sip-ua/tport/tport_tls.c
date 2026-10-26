@@ -1300,6 +1300,7 @@ int tls_connect(su_root_magic_t *magic, su_wait_t *w, tport_t *self)
   tls_t *tls;
   int events = su_wait_events(w, self->tp_socket);
   int error;
+  char const *fail_reason = NULL;
 
   SU_DEBUG_7(("%s(%p): events%s%s%s%s\n", __func__, (void *)self,
               events & (SU_WAIT_CONNECT) ? " CONNECTING" : "",
@@ -1430,6 +1431,7 @@ int tls_connect(su_root_magic_t *magic, su_wait_t *w, tport_t *self)
                     self->tp_canon ? self->tp_canon : (self->tp_host ? self->tp_host : "?"),
                     self->tp_port ? self->tp_port : "?",
                     X509_verify_cert_error_string(status)));
+	fail_reason = X509_verify_cert_error_string(status);
 	break;
 
       default:
@@ -1444,11 +1446,24 @@ int tls_connect(su_root_magic_t *magic, su_wait_t *w, tport_t *self)
                     self->tp_port ? self->tp_port : "?",
                     status));
         tls_log_errors(1, "TLS setup failed", 0);
+        fail_reason = "TLS handshake failed";
         break;
     }
   }
 
-  /* TLS Handshake Failed or Peer Certificate did not Verify */
+  /* TLS Handshake Failed or Peer Certificate did not Verify.
+
+     For an outbound connection with a queued request, report a transport error
+     so the stack fails the transaction promptly with a 503 (carrying the reason)
+     instead of leaving it to time out as a 408.  EPROTO is a positive errno that
+     NTA maps to 503 (unlike the -1 tport_close would otherwise report, which is
+     flattened to "stream closed" / errno 0 and silently ignored).  Stash the
+     reason first so the stack can put it in a Reason header. */
+  if (fail_reason && self->tp_pused && !self->tp_accepted) {
+    tport_set_error_reason(self, fail_reason);
+    tport_error_report(self, EPROTO, NULL);
+  }
+
   tport_close(self);
   tport_set_secondary_timer(self);
 
